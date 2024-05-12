@@ -21,4 +21,4 @@ ENV HOME /home/nonroot
 
 COPY --from=build /work/golink /golink
 ENTRYPOINT ["/golink"]
-CMD ["--sqlitedb", "/home/nonroot/golink.db", "--verbose"]
+CMD ["--sqlitedb", "/home/nonroot/golink.db", "--port", "80", "--verbose"]

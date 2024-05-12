@@ -107,11 +107,6 @@
                 description = "Path to SQLite database";
               };
 
-              tailscaleAuthKeyFile = mkOption {
-                type = types.path;
-                description = "Path to file containing the Tailscale Auth Key";
-              };
-
               verbose = mkOption {
                 type = types.bool;
                 default = false;
@@ -140,10 +135,6 @@
                     ++ lib.optionals cfg.verbose [ "--verbose" ];
                 in
                 ''
-                  ${lib.optionalString (cfg.tailscaleAuthKeyFile != null) ''
-                    export TS_AUTHKEY="$(head -n1 ${lib.escapeShellArg cfg.tailscaleAuthKeyFile})"
-                  ''}
-
                   ${cfg.package}/bin/golink ${builtins.concatStringsSep " " args}
                 '';
               wantedBy = [ "multi-user.target" ];

@@ -1,7 +1,7 @@
 // Copyright 2022 Tailscale Inc & Contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The golink server runs http://go/, a private shortlink service for tailnets.
+// The golink server runs http://go/, a private shortlink service.
 package golink
 
 import (
@@ -31,21 +31,18 @@ import (
 	"time"
 
 	"golang.org/x/net/xsrftoken"
-	"tailscale.com/client/tailscale"
-	"tailscale.com/hostinfo"
-	"tailscale.com/ipn"
-	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
-	"tailscale.com/util/dnsname"
+
+	"github.com/pomerium/sdk-go"
 )
 
 const defaultHostname = "go"
 
 var (
 	verbose           = flag.Bool("verbose", false, "be verbose")
-	controlURL        = flag.String("control-url", ipn.DefaultControlURL, "the URL base of the control plane (i.e. coordination server)")
+	port              = flag.String("port", "80", "port to listen and serve on")
 	sqlitefile        = flag.String("sqlitedb", "", "path of SQLite database to store links")
 	dev               = flag.String("dev-listen", "", "if non-empty, listen on this addr and run in dev mode; auto-set sqlitedb if empty and don't use tsnet")
+	jwksEndpoint      = flag.String("jwks-endpoint", "", "path to JWKS Endpoint to validate identity tokens")
 	snapshot          = flag.String("snapshot", "", "file path of snapshot file")
 	hostname          = flag.String("hostname", defaultHostname, "service name")
 	resolveFromBackup = flag.String("resolve-from-backup", "", "resolve a link from snapshot file and exit")
@@ -70,12 +67,8 @@ var embeddedFS embed.FS
 // db stores short links.
 var db *SQLiteDB
 
-var localClient *tailscale.LocalClient
-
 func Run() error {
 	flag.Parse()
-
-	hostinfo.SetApp("golink")
 
 	// if resolving from backup, set sqlitefile and snapshot flags to
 	// restore links into an in-memory sqlite database.
@@ -98,6 +91,16 @@ func Run() error {
 		} else {
 			return errors.New("--sqlitedb is required")
 		}
+	}
+
+	if *jwksEndpoint == "" {
+		if !*allowUnknownUsers {
+			return errors.New("--jwks-endpoint is required to verify users")
+		}
+	}
+
+	if *port == "" {
+		return errors.New("--port is required")
 	}
 
 	var err error
@@ -159,64 +162,11 @@ func Run() error {
 		return errors.New("--hostname, if specified, cannot be empty")
 	}
 
-	// create tsNet server and wait for it to be ready & connected.
-	srv := &tsnet.Server{
-		ControlURL: *controlURL,
-		Hostname:   *hostname,
-		Logf:       func(format string, args ...any) {},
-	}
-	if *verbose {
-		srv.Logf = log.Printf
-	}
-	if err := srv.Start(); err != nil {
-		return err
-	}
-
-	localClient, _ = srv.LocalClient()
-out:
-	for {
-		upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		status, err := srv.Up(upCtx)
-		if err == nil && status != nil {
-			break out
-		}
-	}
-
-	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	status, err := localClient.Status(statusCtx)
-	if err != nil {
-		return err
-	}
-	enableTLS := status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
-	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
-
 	httpHandler := serveHandler()
-	if enableTLS {
-		httpsHandler := HSTS(httpHandler)
-		httpHandler = redirectHandler(fqdn)
-
-		httpsListener, err := srv.ListenTLS("tcp", ":443")
-		if err != nil {
-			return err
-		}
-		log.Println("Listening on :443")
-		go func() {
-			log.Printf("Serving https://%s/ ...", fqdn)
-			if err := http.Serve(httpsListener, httpsHandler); err != nil {
-				log.Fatal(err)
-			}
-		}()
-	}
-
-	httpListener, err := srv.Listen("tcp", ":80")
-	log.Println("Listening on :80")
-	if err != nil {
-		return err
-	}
+	listenOnPort := fmt.Sprintf(":%s", *port)
+	log.Printf("Listening on %s", listenOnPort)
 	log.Printf("Serving http://%s/ ...", *hostname)
-	if err := http.Serve(httpListener, httpHandler); err != nil {
+	if err := http.ListenAndServe(listenOnPort, httpHandler); err != nil {
 		return err
 	}
 
@@ -334,26 +284,6 @@ func redirectHandler(hostname string) http.Handler {
 	})
 }
 
-// HSTS wraps the provided handler and sets Strict-Transport-Security header on
-// responses. It inspects the Host header to ensure we do not specify HSTS
-// response on non fully qualified domain name origins.
-func HSTS(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, found := r.Header["Host"]
-		if found {
-			host := host[0]
-			fqdn, err := dnsname.ToFQDN(host)
-			if err == nil {
-				segCount := fqdn.NumLabels()
-				if segCount > 1 {
-					w.Header().Set("Strict-Transport-Security", "max-age=31536000")
-				}
-			}
-		}
-		h.ServeHTTP(w, r)
-	})
-}
-
 // serverHandler returns the main http.Handler for serving all requests.
 func serveHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -366,6 +296,7 @@ func serveHandler() http.Handler {
 	mux.Handle("/.static/", http.StripPrefix("/.", http.FileServer(http.FS(embeddedFS))))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
 		// all internal URLs begin with a leading "."; any other URL is treated as a go link.
 		// Serve go links directly without passing through the ServeMux,
 		// which sometimes modifies the request URL path, which we don't want.
@@ -630,8 +561,6 @@ func expandLink(long string, env expandEnv) (*url.URL, error) {
 
 func devMode() bool { return *dev != "" }
 
-const peerCapName = "tailscale.com/cap/golink"
-
 type capabilities struct {
 	Admin bool `json:"admin"`
 }
@@ -641,58 +570,42 @@ type user struct {
 	isAdmin bool
 }
 
-// currentUser returns the Tailscale user associated with the request.
-// In most cases, this will be the user that owns the device that made the request.
-// For tagged devices, the value "tagged-devices" is returned.
-// If the user can't be determined (such as requests coming through a subnet router),
-// an error is returned unless the -allow-unknown-users flag is set.
+// currentUser returns the user associated with the request's JWT.
 var currentUser = func(r *http.Request) (user, error) {
 	if devMode() {
-		return user{login: "foo@example.com"}, nil
+		return user{login: "user@dev.example.com"}, nil
 	}
-	whois, err := localClient.WhoIs(r.Context(), r.RemoteAddr)
+
+	if *allowUnknownUsers {
+		return user{login: "anonymous"}, nil
+	}
+
+	verifier, err := sdk.New(&sdk.Options{
+		JWKSEndpoint: *jwksEndpoint,
+	})
+
 	if err != nil {
-		if *allowUnknownUsers {
-			// Don't report the error if we are allowing unknown users.
-			return user{}, nil
-		}
+		log.Printf("invalid JWT configuration error: %s", err)
 		return user{}, err
 	}
-	login := whois.UserProfile.LoginName
-	caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
-	for _, cap := range caps {
-		if cap.Admin {
-			return user{login: login, isAdmin: true}, nil
-		}
+
+	id, err := verifier.GetIdentity(r.Context(), sdk.TokenFromHeader(r))
+
+	if err != nil {
+		log.Printf("JWT verification error: %s", err)
+		return user{}, err
 	}
-	return user{login: login}, nil
+
+	return user{login: id.Email}, nil
 }
 
 // userExists returns whether a user exists with the specified login in the current tailnet.
 func userExists(ctx context.Context, login string) (bool, error) {
-	const userTaggedDevices = "tagged-devices" // owner of tagged devices
-
-	if login == userTaggedDevices {
-		return false, nil
-	}
-
 	if devMode() {
 		// in dev mode, just assume the user exists
 		return true, nil
 	}
-	st, err := localClient.Status(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, user := range st.User {
-		if user.LoginName == userTaggedDevices {
-			continue
-		}
-		if user.LoginName == login {
-			return true, nil
-		}
-	}
-	return false, nil
+	return true, nil
 }
 
 var reShortName = regexp.MustCompile(`^\w[\w\-\.]*$`)

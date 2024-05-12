@@ -5,7 +5,7 @@ import (
 	_ "embed"
 	"log"
 
-	"github.com/tailscale/golink"
+	"github.com/asciimike/golink"
 )
 
 func main() {
