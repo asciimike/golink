@@ -35,7 +35,20 @@ import (
 	"github.com/pomerium/sdk-go"
 )
 
-const defaultHostname = "go"
+const (
+	defaultHostname = "go"
+
+	// Used as a placeholder short name for generating the XSRF defense token,
+	// when creating new links.
+	newShortName = ".new"
+
+	// If the caller sends this header set to a non-empty value, we will allow
+	// them to make the call even without an XSRF token. JavaScript in browser
+	// cannot set this header, per the [Fetch Spec].
+	//
+	// [Fetch Spec]: https://fetch.spec.whatwg.org
+	secHeaderName = "Sec-Golink"
+)
 
 var (
 	verbose           = flag.Bool("verbose", false, "be verbose")
@@ -43,6 +56,7 @@ var (
 	sqlitefile        = flag.String("sqlitedb", "", "path of SQLite database to store links")
 	dev               = flag.String("dev-listen", "", "if non-empty, listen on this addr and run in dev mode; auto-set sqlitedb if empty and don't use tsnet")
 	jwksEndpoint      = flag.String("jwks-endpoint", "", "path to JWKS Endpoint to validate identity tokens")
+	useHTTPS          = flag.Bool("https", true, "serve golink over HTTPS if enabled on tailnet")
 	snapshot          = flag.String("snapshot", "", "file path of snapshot file")
 	hostname          = flag.String("hostname", defaultHostname, "service name")
 	resolveFromBackup = flag.String("resolve-from-backup", "", "resolve a link from snapshot file and exit")
@@ -202,10 +216,19 @@ type visitData struct {
 	NumClicks int
 }
 
-// homeData is the data used by the homeTmpl template.
+// homeData is the data used by homeTmpl.
 type homeData struct {
 	Short  string
+	Long   string
 	Clicks []visitData
+	XSRF   string
+}
+
+// deleteData is the data used by deleteTmpl.
+type deleteData struct {
+	Short string
+	Long  string
+	XSRF  string
 }
 
 var xsrfKey string
@@ -308,7 +331,7 @@ func serveHandler() http.Handler {
 	})
 }
 
-func serveHome(w http.ResponseWriter, short string) {
+func serveHome(w http.ResponseWriter, r *http.Request, short string) {
 	var clicks []visitData
 
 	stats.mu.Lock()
@@ -330,9 +353,14 @@ func serveHome(w http.ResponseWriter, short string) {
 		clicks = clicks[:200]
 	}
 
+	cu, err := currentUser(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	homeTmpl.Execute(w, homeData{
-		Short:  short,
 		Clicks: clicks,
+		XSRF:   xsrftoken.Generate(xsrfKey, cu.login, newShortName),
 	})
 }
 
@@ -371,7 +399,7 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
 		switch r.Method {
 		case "GET":
-			serveHome(w, "")
+			serveHome(w, r, "")
 		case "POST":
 			serveSave(w, r)
 		}
@@ -389,7 +417,7 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 	link, err := db.Load(short)
 	if errors.Is(err, fs.ErrNotExist) {
 		w.WriteHeader(http.StatusNotFound)
-		serveHome(w, short)
+		serveHome(w, r, short)
 		return
 	}
 	if err != nil {
@@ -515,6 +543,12 @@ var expandFuncMap = texttemplate.FuncMap{
 	"PathEscape":  url.PathEscape,
 	"QueryEscape": url.QueryEscape,
 	"TrimSuffix":  strings.TrimSuffix,
+	"Match":       regexMatch,
+}
+
+func regexMatch(pattern string, s string) bool {
+	b, _ := regexp.MatchString(pattern, s)
+	return b
 }
 
 // expandLink returns the expanded long URL to redirect to, executing any
@@ -634,6 +668,11 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deletion by CLI has never worked because it has always required the XSRF
+	// token. (Refer to commit c7ac33d04c33743606f6224009a5c73aa0b8dec0.) If we
+	// want to enable deletion via CLI and to honor allowUnknownUsers for
+	// deletion, we could change the below to a call to isRequestAuthorized. For
+	// now, always require the XSRF token, thus maintaining the status quo.
 	if !xsrftoken.Valid(r.PostFormValue("xsrf"), xsrfKey, cu.login, short) {
 		http.Error(w, "invalid XSRF token", http.StatusBadRequest)
 		return
@@ -645,7 +684,11 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	deleteLinkStats(link)
 
-	deleteTmpl.Execute(w, link)
+	deleteTmpl.Execute(w, deleteData{
+		Short: link.Short,
+		Long:  link.Long,
+		XSRF:  xsrftoken.Generate(xsrfKey, cu.login, newShortName),
+	})
 }
 
 // serveSave handles requests to save or update a Link.  Both short name and
@@ -679,6 +722,11 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 
 	if !canEditLink(r.Context(), link, cu) {
 		http.Error(w, fmt.Sprintf("cannot update link owned by %q", link.Owner), http.StatusForbidden)
+		return
+	}
+
+	if !isRequestAuthorized(r, cu, short) {
+		http.Error(w, "invalid XSRF token", http.StatusBadRequest)
 		return
 	}
 
@@ -781,8 +829,7 @@ func restoreLastSnapshot() error {
 		_, err := db.Load(link.Short)
 		if err == nil {
 			continue // exists
-		}
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		} else if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 		if err := db.Save(link); err != nil {
@@ -817,4 +864,22 @@ func resolveLink(link *url.URL) (*url.URL, error) {
 		}
 	}
 	return dst, err
+}
+
+func isRequestAuthorized(r *http.Request, u user, short string) bool {
+	if *allowUnknownUsers {
+		return true
+	}
+	if r.Header.Get(secHeaderName) != "" {
+		return true
+	}
+
+	// If the request is to create a new link, test the XSRF token against
+	// newShortName instead of short.
+	tokenShortName := short
+	_, err := db.Load(short)
+	if r.URL.Path == "/" && r.Method == http.MethodPost && errors.Is(err, fs.ErrNotExist) {
+		tokenShortName = newShortName
+	}
+	return xsrftoken.Valid(r.PostFormValue("xsrf"), xsrfKey, u.login, tokenShortName)
 }

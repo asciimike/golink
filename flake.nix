@@ -24,12 +24,12 @@
           pkgs = nixpkgs.legacyPackages.${prev.system};
         in
         rec {
-          golink = pkgs.buildGo121Module rec {
+          golink = pkgs.buildGo122Module rec {
             pname = "golink";
             version = golinkVersion;
             src = pkgs.nix-gitignore.gitignoreSource [ ] ./.;
 
-            vendorSha256 = "sha256-+DC7ybg+2hBdhX7SyAA2zUTCJlUXQwxzT1CjLf3drv4="; # SHA based on vendoring go.mod
+            vendorHash = "sha256-PWeQNlIMvhGAFDVwN8fp0B11Loi6zbm1Pds/CKLeuvA="; # SHA based on vendoring go.mod
           };
         };
     }
@@ -138,7 +138,6 @@
                   ${cfg.package}/bin/golink ${builtins.concatStringsSep " " args}
                 '';
               wantedBy = [ "multi-user.target" ];
-              after = [ "network-online.target" ];
               serviceConfig = {
                 User = cfg.user;
                 Group = cfg.group;
